@@ -96,6 +96,7 @@ fn parse_put_snapshot_load(body: &Body) -> Result<ParsedRequest, RequestError> {
                 // either `mem_file_path` or `mem_backend` field is always specified.
                 backend_path: snapshot_config.mem_file_path.unwrap(),
                 backend_type: MemBackendType::File,
+                shared_memfd_path: None,
             }
         }
     };

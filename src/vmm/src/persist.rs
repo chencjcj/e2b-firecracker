@@ -397,6 +397,7 @@ pub fn restore_from_snapshot(
             mem_state,
             track_dirty_pages,
             vm_resources.machine_config.huge_pages,
+            params.mem_backend.shared_memfd_path.as_deref(),
         )
         .map_err(RestoreFromSnapshotGuestMemoryError::Uffd)?,
     };
@@ -482,19 +483,23 @@ fn guest_memory_from_uffd(
     mem_state: &GuestMemoryState,
     track_dirty_pages: bool,
     huge_pages: HugePageConfig,
+    shared_memfd_path: Option<&Path>,
 ) -> Result<(Vec<GuestRegionMmap>, Option<Uffd>), GuestMemoryFromUffdError> {
     let (guest_memory, backend_mappings) =
-        create_guest_memory(mem_state, track_dirty_pages, huge_pages)?;
+        create_guest_memory(mem_state, track_dirty_pages, huge_pages, shared_memfd_path)?;
+
+    let use_shared_memfd = shared_memfd_path.is_some();
 
     let mut uffd_builder = UffdBuilder::new();
 
-    // We only make use of this if balloon devices are present, but we can enable it unconditionally
-    // because the only place the kernel checks this is in a hook from madvise, e.g. it doesn't
-    // actively change the behavior of UFFD, only passively. Without balloon devices
-    // we never call madvise anyway, so no need to put this into a conditional.
-    uffd_builder.require_features(
-        FeatureFlags::EVENT_REMOVE | FeatureFlags::MISSING_HUGETLBFS | FeatureFlags::WP_ASYNC,
-    );
+    let mut features =
+        FeatureFlags::EVENT_REMOVE | FeatureFlags::MISSING_HUGETLBFS | FeatureFlags::WP_ASYNC;
+    if use_shared_memfd {
+        // UFFD_FEATURE_MINOR_HUGETLBFS (1 << 9) is required for MINOR fault handling on
+        // hugetlbfs. Not exposed by the userfaultfd crate; inject via from_bits_retain.
+        features |= FeatureFlags::from_bits_retain(1 << 9);
+    }
+    uffd_builder.require_features(features);
 
     let uffd = uffd_builder
         .close_on_exec(true)
@@ -503,20 +508,24 @@ fn guest_memory_from_uffd(
         .create()
         .map_err(GuestMemoryFromUffdError::Create)?;
 
+    // With shared_memfd: register MINOR to enable UFFDIO_CONTINUE zero-copy sharing.
+    // Keep MISSING as fallback for pages not yet populated in the memfd page cache
+    // (orchestrator will populate + UFFDIO_WAKE, kernel retries as MINOR).
+    let register_mode = if use_shared_memfd {
+        RegisterMode::MISSING | RegisterMode::MINOR | RegisterMode::WRITE_PROTECT
+    } else {
+        RegisterMode::MISSING | RegisterMode::WRITE_PROTECT
+    };
+
     for mem_region in guest_memory.iter() {
         uffd.register_with_mode(
             mem_region.as_ptr().cast(),
             mem_region.size() as _,
-            RegisterMode::MISSING | RegisterMode::WRITE_PROTECT,
+            register_mode,
         )
         .map_err(GuestMemoryFromUffdError::Register)?;
 
-        // If memory is backed by huge pages, we can immediately write protect it.
-        // Otherwise (memory is backed by anonymous memory), write protecting here
-        // won't have any effect, as the write-protection bit for a page will be
-        // wiped when the first page fault occurs. These cases need to be handled
-        // directly from the UFFD handler.
-        if huge_pages.is_hugetlbfs() {
+        if huge_pages.is_hugetlbfs() && !use_shared_memfd {
             uffd.write_protect(mem_region.as_ptr().cast(), mem_region.size() as _)
                 .map_err(GuestMemoryFromUffdError::WriteProtect)?;
         }
@@ -531,8 +540,14 @@ fn create_guest_memory(
     mem_state: &GuestMemoryState,
     track_dirty_pages: bool,
     huge_pages: HugePageConfig,
+    shared_memfd_path: Option<&Path>,
 ) -> Result<(Vec<GuestRegionMmap>, Vec<GuestRegionUffdMapping>), GuestMemoryFromUffdError> {
-    let guest_memory = memory::anonymous(mem_state.regions(), track_dirty_pages, huge_pages)?;
+    let guest_memory = if let Some(memfd_path) = shared_memfd_path {
+        let file = File::open(memfd_path)?;
+        memory::shared_memfd(file, mem_state.regions(), track_dirty_pages, huge_pages)?
+    } else {
+        memory::anonymous(mem_state.regions(), track_dirty_pages, huge_pages)?
+    };
     let mut backend_mappings = Vec::with_capacity(guest_memory.len());
     let mut offset = 0;
     for mem_region in guest_memory.iter() {

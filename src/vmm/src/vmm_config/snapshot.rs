@@ -103,12 +103,17 @@ pub struct LoadSnapshotConfig {
 
 /// Stores the configuration used for managing snapshot memory.
 #[derive(Debug, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct MemBackendConfig {
     /// Path to the backend used to handle the guest memory.
     pub backend_path: PathBuf,
     /// Specifies the guest memory backend type.
     pub backend_type: MemBackendType,
+    /// Optional path to a shared memfd file (via /proc/<pid>/fd/<N>).
+    /// When set, guest memory is mmap'd MAP_PRIVATE from this file instead of
+    /// MAP_PRIVATE|MAP_ANONYMOUS, and UFFD is registered for MINOR faults
+    /// instead of MISSING faults. This enables physical page sharing across VMs.
+    #[serde(default)]
+    pub shared_memfd_path: Option<PathBuf>,
 }
 
 /// The microVM state options.

@@ -132,6 +132,22 @@ pub fn snapshot_file(
     create(regions, libc::MAP_PRIVATE, Some(file), track_dirty_pages)
 }
 
+/// Creates a GuestMemoryMmap backed by a shared memfd with MAP_PRIVATE semantics.
+/// Reads share physical pages with the memfd; writes trigger COW.
+pub fn shared_memfd(
+    file: File,
+    regions: impl Iterator<Item = (GuestAddress, usize)>,
+    track_dirty_pages: bool,
+    huge_pages: HugePageConfig,
+) -> Result<Vec<GuestRegionMmap>, MemoryError> {
+    create(
+        regions,
+        libc::MAP_PRIVATE | huge_pages.mmap_flags(),
+        Some(file),
+        track_dirty_pages,
+    )
+}
+
 /// Defines the interface for snapshotting memory.
 pub trait GuestMemoryExtension
 where
